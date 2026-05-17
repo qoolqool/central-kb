@@ -1,0 +1,46 @@
+services:
+  tooling-central:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tooling-central
+    command: uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
+    ports:
+      - "9000:9000"
+    volumes:
+      - central-kb-data:/data
+      - ./app:/app/app
+      - ./kb_cli:/app/kb_cli
+    environment:
+      - CENTRAL_KB_DB_PATH=/data/central-kb.sqlite3
+      - EMBED_SERVER_URL=http://embed-server:9001
+    depends_on:
+      embed-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  embed-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.embed-server
+    container_name: central-kb-embed
+    ports:
+      - "9001:9001"
+    environment:
+      - EMBED_HOST=0.0.0.0
+      - EMBED_PORT=9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  central-kb-data:

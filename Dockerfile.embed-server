@@ -1,0 +1,43 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# --- SSL for corporate proxies ---
+# If your environment uses a corporate proxy with SSL inspection, place your
+# CA certificate file in this directory as `proxy-ca.crt` and uncomment the
+# lines below to trust it for pip, curl, and Python:
+#
+#   COPY proxy-ca.crt /usr/local/share/ca-certificates/proxy-ca.crt
+#   RUN apt-get update -qq && \
+#       apt-get install -y -qq --no-install-recommends \
+#           ca-certificates curl 2>/dev/null && \
+#       cat /usr/local/share/ca-certificates/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
+#       update-ca-certificates 2>/dev/null; \
+#       rm -rf /var/lib/apt/lists/*
+#   ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+#   ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+#   ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+#   ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# --- Sentence-transformers with CPU-only PyTorch ---
+# Avoids hash mismatch errors from nvidia-* GPU packages (known pip issue)
+# See: https://github.com/huggingface/sentence-transformers/issues/1409
+
+# Step 1: CPU-only PyTorch (no GPU binaries ~2GB smaller)
+RUN pip install --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Step 2: sentence-transformers dependencies
+RUN pip install --no-cache-dir transformers tqdm numpy scikit-learn scipy
+
+# Step 3: sentence-transformers itself (without re-pulling torch)
+RUN pip install --no-cache-dir --no-deps sentence-transformers
+
+# --- Application ---
+COPY scripts/embed-server.py scripts/embed-server.py
+
+EXPOSE 9001
+
+# Model loads at startup (~15s for bge-large-en-v1.5, plus HuggingFace download)
+# The healthcheck (curl /health) will fail until the model is loaded
+CMD ["python3", "scripts/embed-server.py", "--host", "0.0.0.0", "--port", "9001"]

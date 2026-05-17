@@ -1,0 +1,27 @@
+[project]
+name = "central-kb"
+version = "0.1.0"
+description = "Centralized multi-project knowledge base"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.0",
+    "httpx>=0.27.0",
+    "sentence-transformers>=2.2.0",
+]
+
+[project.scripts]
+kb = "kb_cli.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "anyio>=4.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app", "app.*", "kb_cli", "kb_cli.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
