@@ -4,13 +4,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: tooling-central
-    command: uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 9000
     ports:
       - "9000:9000"
     volumes:
       - central-kb-data:/data
-      - ./app:/app/app
-      - ./kb_cli:/app/kb_cli
     environment:
       - CENTRAL_KB_DB_PATH=/data/central-kb.sqlite3
       - EMBED_SERVER_URL=http://embed-server:9001
