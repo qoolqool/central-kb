@@ -2,22 +2,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# --- SSL for corporate proxies ---
-# If your environment uses a corporate proxy with SSL inspection, place your
-# CA certificate file in this directory as `proxy-ca.crt` and uncomment the
-# lines below to trust it for pip, curl, and Python:
-#
-#   COPY proxy-ca.crt /usr/local/share/ca-certificates/proxy-ca.crt
-#   RUN apt-get update -qq && \
-#       apt-get install -y -qq --no-install-recommends \
-#           ca-certificates curl 2>/dev/null && \
-#       cat /usr/local/share/ca-certificates/proxy-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
-#       update-ca-certificates 2>/dev/null; \
-#       rm -rf /var/lib/apt/lists/*
-#   ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
-#   ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-#   ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-#   ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+# --- CA Certificates (for corporate proxy / Cloudflare Gateway) ---
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Cloudflare Gateway CA if available in build context
+COPY cloudflare-gateway.cr[t] /tmp/
+RUN if [ -f /tmp/cloudflare-gateway.crt ]; then \
+      cp /tmp/cloudflare-gateway.crt /usr/local/share/ca-certificates/ && \
+      update-ca-certificates --fresh; \
+    else \
+      echo "⚠ No cloudflare-gateway.crt - using system CAs only"; \
+    fi
+
+# Set SSL environment variables for pip, curl, and Python
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt
 
 # --- Sentence-transformers with CPU-only PyTorch ---
 # Avoids hash mismatch errors from nvidia-* GPU packages (known pip issue)

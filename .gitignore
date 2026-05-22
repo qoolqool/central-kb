@@ -6,3 +6,4 @@ __pycache__/
 *.sock
 data/
 .pi/
+cloudflare-gateway.crt
