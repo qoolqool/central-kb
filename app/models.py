@@ -7,7 +7,7 @@ EXPECTED_VEC_DIM = 1024
 
 
 class EntrySubmission(BaseModel):
-    """A single entry being submitted to the central KB."""
+    """A single entry being submitted to the central KB (legacy format)."""
     namespace: str = Field(..., pattern=r"^(decisions|patterns|sessions)$")
     key: str
     title: str
@@ -27,10 +27,34 @@ class EntrySubmission(BaseModel):
         return v
 
 
+class OKFEntrySubmission(BaseModel):
+    """A single entry submitted as OKF markdown (frontmatter + body).
+
+    The markdown is parsed server-side to extract frontmatter fields.
+    """
+    markdown: str = Field(..., description="Full OKF markdown with YAML frontmatter")
+    namespace: Optional[str] = Field(None, description="Override namespace (auto-detected from type if omitted)")
+    key: Optional[str] = Field(None, description="Override key (auto-detected from title if omitted)")
+    vector: Optional[list[float]] = None
+    simhash: int = 0
+
+    @field_validator("vector")
+    @classmethod
+    def check_vector_dimension(cls, v: Optional[list[float]]) -> Optional[list[float]]:
+        if v is not None and len(v) != EXPECTED_VEC_DIM:
+            raise ValueError(
+                f"Expected {EXPECTED_VEC_DIM}-dim vector from bge-large-en-v1.5, "
+                f"got {len(v)}-dim. All embeddings must be {EXPECTED_VEC_DIM} dimensions."
+            )
+        return v
+
+
 class SubmitRequest(BaseModel):
     project: str
     source: str = "local:unknown"
-    entries: list[EntrySubmission]
+    entries: list[EntrySubmission] = Field(default_factory=list)
+    okf_entries: list[OKFEntrySubmission] = Field(default_factory=list,
+                                                    description="OKF markdown entries")
 
 
 class SubmitDetail(BaseModel):
@@ -84,6 +108,10 @@ class SearchResult(BaseModel):
     score: float
     cosine_score: float
     fts_score: float
+    okf_type: Optional[str] = None
+    okf_tags: Optional[list[str]] = None
+    okf_description: Optional[str] = None
+    okf_timestamp: Optional[str] = None
 
 
 class SearchResponse(BaseModel):

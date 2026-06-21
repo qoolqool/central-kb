@@ -22,6 +22,8 @@ from app.models import (
     Conflict,
     ConflictListResponse,
     ConflictResolveRequest,
+    EntrySubmission,
+    OKFEntrySubmission,
     PromoteRequest,
     PullEntry,
     PullResponse,
@@ -32,6 +34,7 @@ from app.models import (
     SubmitDetail,
     EXPECTED_VEC_DIM,
 )
+from app.okf import parse_okf_markdown, extract_body_for_embedding, OKFValidationError
 from app.search import hybrid_search
 
 
@@ -44,6 +47,214 @@ def _resolve_db_url(db_url: Optional[str]) -> str:
     if db_url is None:
         db_url = os.environ.get("CENTRAL_KB_DB_PATH", "/data/central-kb.sqlite3")
     return db_url
+
+
+def _map_type_to_namespace(okf_type: str) -> str:
+    """Map an OKF type to a namespace for storage."""
+    type_lower = okf_type.lower()
+    if "decision" in type_lower:
+        return "decisions"
+    elif "pattern" in type_lower or "playbook" in type_lower or "runbook" in type_lower:
+        return "patterns"
+    elif "session" in type_lower:
+        return "sessions"
+    elif "metric" in type_lower:
+        return "metrics"
+    elif "table" in type_lower or "dataset" in type_lower:
+        return "tables"
+    else:
+        return "concepts"
+
+
+def _make_key_from_title(title: str) -> str:
+    """Convert a title to a URL-safe key."""
+    import re
+    key = title.lower().strip()
+    key = re.sub(r"[^a-z0-9]+", "-", key)
+    key = key.strip("-")
+    return key[:100] or "untitled"
+
+
+def _process_entry(conn, req, namespace: str, key: str, title: str,
+                   content: str, metadata_json: str, vec_blob: bytes,
+                   sh: int, fqn: str) -> dict:
+    """Process a single entry through the 3-phase pipeline.
+
+    Returns dict with keys: status (accepted/duplicate/conflicted/error),
+    detail (SubmitDetail), and optionally conflict_id.
+    """
+    from app.dedup import simhash_similarity, classify_similarity
+
+    # Phase 1: Dedup
+    existing = conn.execute(
+        "SELECT fqn, simhash, version, content FROM entries "
+        "WHERE scope = ? AND namespace = ? AND status = 'accepted'",
+        (req.project, namespace)
+    ).fetchall()
+
+    for ex_row in existing:
+        ex_simhash = ex_row[1]
+        sim = simhash_similarity(sh, ex_simhash)
+        action, reason = classify_similarity(sim)
+        if action == "auto_merge":
+            cur_version = conn.execute(
+                "SELECT value FROM meta WHERE key = 'current_version'"
+            ).fetchone()[0]
+            new_version = int(cur_version) + 1
+
+            if ex_row[0] == fqn:
+                # Same key — UPDATE in-place
+                conn.execute(
+                    "UPDATE entries SET title = ?, content = ?,"
+                    "metadata_json = ?, vector = ?, simhash = ?,"
+                    "version = ?, source = ?, status = 'accepted',"
+                    "updated_at = datetime('now') WHERE fqn = ?",
+                    (title, content, metadata_json, vec_blob, sh,
+                     new_version, req.source, fqn)
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'current_version'",
+                    (str(new_version),)
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
+                    "VALUES (?, ?, ?, ?)",
+                    (fqn, req.project, namespace, content)
+                )
+
+                return {
+                    "status": "duplicate",
+                    "detail": SubmitDetail(
+                        fqn=fqn, status="auto_merged",
+                        version=new_version, superseded_by=fqn,
+                    )
+                }
+            else:
+                # Different key — supersede old entry, insert new one
+                conn.execute(
+                    "UPDATE entries SET status = 'superseded' WHERE fqn = ?",
+                    (ex_row[0],)
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO entries (fqn, namespace, scope, key, title, content,"
+                    "metadata_json, vector, simhash, version, source, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')",
+                    (fqn, namespace, req.project, key, title,
+                     content, metadata_json, vec_blob, sh,
+                     new_version, req.source)
+                )
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'current_version'",
+                    (str(new_version),)
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
+                    "VALUES (?, ?, ?, ?)",
+                    (fqn, req.project, namespace, content)
+                )
+
+                return {
+                    "status": "duplicate",
+                    "detail": SubmitDetail(
+                        fqn=fqn, status="superseded_by",
+                        version=new_version, superseded_by=ex_row[0],
+                    )
+                }
+        elif action == "review":
+            cur = conn.execute(
+                "INSERT INTO conflicts (existing_fqn, proposed_fqn, proposed_content, similarity) "
+                "VALUES (?, ?, ?, ?)",
+                (ex_row[0], fqn, content, sim)
+            )
+            return {
+                "status": "conflicted",
+                "conflict_id": cur.lastrowid,
+                "detail": SubmitDetail(
+                    fqn=fqn, status="conflicted", conflict_id=cur.lastrowid,
+                )
+            }
+
+    # Phase 2: Check for conflict (same key, different content)
+    existing_exact = conn.execute(
+        "SELECT id, status FROM entries WHERE scope = ? AND namespace = ? AND key = ? AND status = 'accepted'",
+        (req.project, namespace, key)
+    ).fetchone()
+
+    existing_superseded = conn.execute(
+        "SELECT id FROM entries WHERE scope = ? AND namespace = ? AND key = ? AND status = 'superseded'",
+        (req.project, namespace, key)
+    ).fetchone()
+
+    if existing_exact:
+        cur = conn.execute(
+            "INSERT INTO conflicts (existing_fqn, proposed_fqn, proposed_content, similarity) "
+            "VALUES (?, ?, ?, ?)",
+            (_make_fqn(req.project, namespace, key),
+             fqn, content, 1.0)
+        )
+        return {
+            "status": "conflicted",
+            "conflict_id": cur.lastrowid,
+            "detail": SubmitDetail(
+                fqn=fqn, status="conflicted", conflict_id=cur.lastrowid,
+            )
+        }
+    elif existing_superseded:
+        cur_version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'current_version'"
+        ).fetchone()[0]
+        new_version = int(cur_version) + 1
+        conn.execute(
+            "UPDATE entries SET title = ?, content = ?,"
+            "metadata_json = ?, vector = ?, simhash = ?,"
+            "version = ?, source = ?, status = 'accepted',"
+            "updated_at = datetime('now') WHERE scope = ? AND namespace = ? AND key = ? AND status = 'superseded'",
+            (title, content, metadata_json, vec_blob, sh,
+             new_version, req.source,
+             req.project, namespace, key)
+        )
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'current_version'",
+            (str(new_version),)
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
+            "VALUES (?, ?, ?, ?)",
+            (fqn, req.project, namespace, content)
+        )
+
+        return {
+            "status": "accepted",
+            "detail": SubmitDetail(fqn=fqn, status="accepted", version=new_version),
+        }
+
+    # Phase 3: Publish
+    cur_version = conn.execute(
+        "SELECT value FROM meta WHERE key = 'current_version'"
+    ).fetchone()[0]
+    new_version = int(cur_version) + 1
+    conn.execute(
+        "INSERT INTO entries (fqn, namespace, scope, key, title, content,"
+        "metadata_json, vector, simhash, version, source, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')",
+        (fqn, namespace, req.project, key, title,
+         content, metadata_json, vec_blob, sh,
+         new_version, req.source)
+    )
+    conn.execute(
+        "UPDATE meta SET value = ? WHERE key = 'current_version'",
+        (str(new_version),)
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
+        "VALUES (?, ?, ?, ?)",
+        (fqn, req.project, namespace, content)
+    )
+
+    return {
+        "status": "accepted",
+        "detail": SubmitDetail(fqn=fqn, status="accepted", version=new_version),
+    }
 
 
 def _connect(db_url: str):
@@ -110,6 +321,7 @@ def create_app(db_url: Optional[str] = None) -> FastAPI:
             conflict_ids: list[int] = []
             details: list[SubmitDetail] = []
 
+            # Process legacy entries (EntrySubmission)
             for entry in req.entries:
                 fqn = _make_fqn(req.project, entry.namespace, entry.key)
                 content_text = f"{entry.title}\n{entry.content}"
@@ -130,180 +342,71 @@ def create_app(db_url: Optional[str] = None) -> FastAPI:
                     continue
                 vec_blob = pack_vector(vec)
 
-                # Phase 1: Dedup
-                existing = conn.execute(
-                    "SELECT fqn, simhash, version, content FROM entries "
-                    "WHERE scope = ? AND namespace = ? AND status = 'accepted'",
-                    (req.project, entry.namespace)
-                ).fetchall()
-
-                dedup_hit = False
-                for ex_row in existing:
-                    ex_simhash = ex_row[1]
-                    sim = simhash_similarity(sh, ex_simhash)
-                    action, reason = classify_similarity(sim)
-                    if action == "auto_merge":
-                        cur_version = conn.execute(
-                            "SELECT value FROM meta WHERE key = 'current_version'"
-                        ).fetchone()[0]
-                        new_version = int(cur_version) + 1
-
-                        if ex_row[0] == fqn:
-                            # Same key — UPDATE in-place to avoid UNIQUE constraint violation
-                            conn.execute(
-                                "UPDATE entries SET title = ?, content = ?,"
-                                "metadata_json = ?, vector = ?, simhash = ?,"
-                                "version = ?, source = ?, status = 'accepted',"
-                                "updated_at = datetime('now') WHERE fqn = ?",
-                                (entry.title, entry.content,
-                                 json.dumps(entry.metadata), vec_blob, sh,
-                                 new_version, req.source, fqn)
-                            )
-                            conn.execute(
-                                "UPDATE meta SET value = ? WHERE key = 'current_version'",
-                                (str(new_version),)
-                            )
-                            conn.execute(
-                                "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
-                                "VALUES (?, ?, ?, ?)",
-                                (fqn, req.project, entry.namespace, entry.content)
-                            )
-
-                            duplicates += 1
-                            details.append(SubmitDetail(
-                                fqn=fqn,
-                                status="auto_merged",
-                                version=new_version,
-                                superseded_by=fqn,
-                            ))
-                        else:
-                            # Different key — supersede old entry, insert new one
-                            conn.execute(
-                                "UPDATE entries SET status = 'superseded' WHERE fqn = ?",
-                                (ex_row[0],)
-                            )
-                            conn.execute(
-                                "INSERT OR REPLACE INTO entries (fqn, namespace, scope, key, title, content,"
-                                "metadata_json, vector, simhash, version, source, status) "
-                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')",
-                                (fqn, entry.namespace, req.project, entry.key, entry.title,
-                                 entry.content, json.dumps(entry.metadata), vec_blob, sh,
-                                 new_version, req.source)
-                            )
-                            conn.execute(
-                                "UPDATE meta SET value = ? WHERE key = 'current_version'",
-                                (str(new_version),)
-                            )
-                            conn.execute(
-                                "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
-                                "VALUES (?, ?, ?, ?)",
-                                (fqn, req.project, entry.namespace, entry.content)
-                            )
-
-                            duplicates += 1
-                            details.append(SubmitDetail(
-                                fqn=fqn,
-                                status="superseded_by",
-                                version=new_version,
-                                superseded_by=ex_row[0],
-                            ))
-                        dedup_hit = True
-                        break
-                    elif action == "review":
-                        conflicted += 1
-                        cur = conn.execute(
-                            "INSERT INTO conflicts (existing_fqn, proposed_fqn, proposed_content, similarity) "
-                            "VALUES (?, ?, ?, ?)",
-                            (ex_row[0], fqn, entry.content, sim)
-                        )
-                        conflict_ids.append(cur.lastrowid)
-                        details.append(SubmitDetail(fqn=fqn, status="conflicted", conflict_id=cur.lastrowid))
-                        dedup_hit = True
-                        break
-
-                if dedup_hit:
-                    continue
-
-                # Phase 2: Check for conflict (same key, different content)
-                # Only check accepted entries — superseded ones should be replaceable
-                existing_exact = conn.execute(
-                    "SELECT id, status FROM entries WHERE scope = ? AND namespace = ? AND key = ? AND status = 'accepted'",
-                    (req.project, entry.namespace, entry.key)
-                ).fetchone()
-
-                # Check if a superseded entry exists with same key — if so, revive it
-                existing_superseded = conn.execute(
-                    "SELECT id FROM entries WHERE scope = ? AND namespace = ? AND key = ? AND status = 'superseded'",
-                    (req.project, entry.namespace, entry.key)
-                ).fetchone()
-
-                if existing_exact:
-                    # Same key and content is different enough to warrant review
-                    conflicted += 1
-                    cur = conn.execute(
-                        "INSERT INTO conflicts (existing_fqn, proposed_fqn, proposed_content, similarity) "
-                        "VALUES (?, ?, ?, ?)",
-                        (_make_fqn(req.project, entry.namespace, entry.key),
-                         fqn, entry.content, 1.0)
-                    )
-                    conflict_ids.append(cur.lastrowid)
-                    details.append(SubmitDetail(fqn=fqn, status="conflicted", conflict_id=cur.lastrowid))
-                    continue
-                elif existing_superseded:
-                    # Superseded entry with same key — update it with new content
-                    cur_version = conn.execute(
-                        "SELECT value FROM meta WHERE key = 'current_version'"
-                    ).fetchone()[0]
-                    new_version = int(cur_version) + 1
-                    conn.execute(
-                        "UPDATE entries SET title = ?, content = ?,"
-                        "metadata_json = ?, vector = ?, simhash = ?,"
-                        "version = ?, source = ?, status = 'accepted',"
-                        "updated_at = datetime('now') WHERE scope = ? AND namespace = ? AND key = ? AND status = 'superseded'",
-                        (entry.title, entry.content,
-                         json.dumps(entry.metadata), vec_blob, sh,
-                         new_version, req.source,
-                         req.project, entry.namespace, entry.key)
-                    )
-                    conn.execute(
-                        "UPDATE meta SET value = ? WHERE key = 'current_version'",
-                        (str(new_version),)
-                    )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
-                        "VALUES (?, ?, ?, ?)",
-                        (fqn, req.project, entry.namespace, entry.content)
-                    )
-
+                result = _process_entry(conn, req, entry.namespace, entry.key,
+                                       entry.title, entry.content,
+                                       json.dumps(entry.metadata), vec_blob, sh,
+                                       fqn)
+                if result["status"] == "accepted":
                     accepted += 1
-                    details.append(SubmitDetail(fqn=fqn, status="accepted", version=new_version))
+                elif result["status"] == "duplicate":
+                    duplicates += 1
+                elif result["status"] == "conflicted":
+                    conflicted += 1
+                    conflict_ids.append(result["conflict_id"])
+                details.append(result["detail"])
+
+            # Process OKF entries (OKFEntrySubmission)
+            for okf_entry in req.okf_entries:
+                try:
+                    doc = parse_okf_markdown(okf_entry.markdown)
+                except OKFValidationError as e:
+                    details.append(SubmitDetail(
+                        fqn=f"okf:error:{len(details)}",
+                        status="error",
+                        version=None,
+                    ))
                     continue
 
-                # Phase 3: Publish
-                cur_version = conn.execute(
-                    "SELECT value FROM meta WHERE key = 'current_version'"
-                ).fetchone()[0]
-                new_version = int(cur_version) + 1
-                conn.execute(
-                    "INSERT INTO entries (fqn, namespace, scope, key, title, content,"
-                    "metadata_json, vector, simhash, version, source, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted')",
-                    (fqn, entry.namespace, req.project, entry.key, entry.title,
-                     entry.content, json.dumps(entry.metadata), vec_blob, sh,
-                     new_version, req.source)
-                )
-                conn.execute(
-                    "UPDATE meta SET value = ? WHERE key = 'current_version'",
-                    (str(new_version),)
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO fts_index (fqn, scope, namespace, content) "
-                    "VALUES (?, ?, ?, ?)",
-                    (fqn, req.project, entry.namespace, entry.content)
-                )
+                # Determine namespace from type or override
+                namespace = okf_entry.namespace or _map_type_to_namespace(doc.type)
+                # Determine key from title or override
+                key = okf_entry.key or _make_key_from_title(doc.title or doc.type)
+                fqn = _make_fqn(req.project, namespace, key)
 
-                accepted += 1
-                details.append(SubmitDetail(fqn=fqn, status="accepted", version=new_version))
+                # Full markdown is the content (frontmatter + body preserved)
+                full_markdown = okf_entry.markdown
+                # For embedding, use only the body (strip frontmatter)
+                body_for_embed = extract_body_for_embedding(full_markdown)
+                content_text = f"{doc.title or key}\n{body_for_embed}"
+
+                sh = okf_entry.simhash if okf_entry.simhash else simhash_64(content_text)
+
+                vec = okf_entry.vector
+                if vec is None:
+                    vec = embed_text(content_text)
+                if vec is None:
+                    details.append(SubmitDetail(fqn=fqn, status="error", version=None))
+                    continue
+                if len(vec) != EXPECTED_VEC_DIM:
+                    details.append(SubmitDetail(fqn=fqn, status="error", version=None))
+                    continue
+                vec_blob = pack_vector(vec)
+
+                # Store frontmatter as metadata_json for queryable fields
+                metadata_json = json.dumps(doc.frontmatter)
+
+                result = _process_entry(conn, req, namespace, key,
+                                       doc.title or key, full_markdown,
+                                       metadata_json, vec_blob, sh,
+                                       fqn)
+                if result["status"] == "accepted":
+                    accepted += 1
+                elif result["status"] == "duplicate":
+                    duplicates += 1
+                elif result["status"] == "conflicted":
+                    conflicted += 1
+                    conflict_ids.append(result["conflict_id"])
+                details.append(result["detail"])
 
             conn.commit()
             return SubmitResponse(
@@ -369,10 +472,16 @@ def create_app(db_url: Optional[str] = None) -> FastAPI:
             for r in raw_results:
                 fqn = r["fqn"]
                 row = conn.execute(
-                    "SELECT namespace, scope, title, content FROM entries WHERE fqn = ?",
+                    "SELECT namespace, scope, title, content, metadata_json FROM entries WHERE fqn = ?",
                     (fqn,)
                 ).fetchone()
                 if row:
+                    meta = {}
+                    try:
+                        meta = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                     results.append(SearchResult(
                         fqn=fqn,
                         scope=row["scope"],
@@ -382,6 +491,10 @@ def create_app(db_url: Optional[str] = None) -> FastAPI:
                         score=r["score"],
                         cosine_score=r["cosine_score"],
                         fts_score=r["fts_score"],
+                        okf_type=meta.get("type"),
+                        okf_tags=meta.get("tags"),
+                        okf_description=meta.get("description"),
+                        okf_timestamp=meta.get("timestamp"),
                     ))
 
             return SearchResponse(query=q, results=results)
